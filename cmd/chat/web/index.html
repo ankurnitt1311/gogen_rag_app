@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gogen-rag chat</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #111; color: #eee; }
+    .app { max-width: 1100px; margin: 0 auto; min-height: 100vh; display: grid; grid-template-columns: 320px 1fr; }
+    aside, main { display: flex; flex-direction: column; min-height: 100vh; }
+    aside { border-right: 1px solid #2a2a2a; padding: 1rem; gap: 0.85rem; }
+    main { min-width: 0; }
+    h1 { font-size: 1.15rem; margin: 0; }
+    h2 { font-size: 0.95rem; margin: 0 0 0.4rem; }
+    p, .hint { color: #aaa; font-size: 0.88rem; line-height: 1.4; margin: 0; }
+    .drop {
+      border: 1px dashed #555; border-radius: 10px; padding: 1rem; text-align: center;
+      background: #191919; cursor: pointer;
+    }
+    .drop.over { border-color: #4c8bf5; background: #172033; }
+    .drop input { display: none; }
+    button, .btn {
+      padding: 0.65rem 0.9rem; border: 0; border-radius: 8px; background: #4c8bf5; color: white; cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: wait; }
+    #status { min-height: 1.2rem; font-size: 0.85rem; color: #9ad; }
+    #status.error { color: #f5a; }
+    #docs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+    #docs li { background: #1c1c1c; border-radius: 8px; padding: 0.55rem 0.7rem; font-size: 0.88rem; }
+    #docs span { color: #888; }
+    header { padding: 1rem 1.25rem 0.5rem; }
+    #log { flex: 1; overflow: auto; padding: 1rem 1.25rem; display: flex; flex-direction: column; gap: 0.75rem; }
+    .msg { padding: 0.75rem 0.9rem; border-radius: 12px; white-space: pre-wrap; line-height: 1.4; }
+    .user { align-self: flex-end; background: #2b4c7e; }
+    .assistant { align-self: flex-start; background: #222; }
+    .error { align-self: flex-start; background: #4a1f1f; }
+    form#form { display: flex; gap: 0.5rem; padding: 1rem 1.25rem 1.25rem; }
+    form#form input { flex: 1; padding: 0.7rem 0.8rem; border-radius: 8px; border: 1px solid #444; background: #1a1a1a; color: inherit; }
+    @media (max-width: 800px) {
+      .app { grid-template-columns: 1fr; }
+      aside, main { min-height: auto; }
+      aside { border-right: 0; border-bottom: 1px solid #2a2a2a; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div>
+        <h1>Company docs</h1>
+        <p class="hint">Upload a PDF, Markdown, or text policy. Text PDFs work; scanned image-only PDFs do not.</p>
+      </div>
+      <label class="drop" id="drop">
+        <input id="file" type="file" accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown">
+        Drop a file here or click to choose
+      </label>
+      <div id="status"></div>
+      <div>
+        <h2>Ingested</h2>
+        <ul id="docs"></ul>
+      </div>
+    </aside>
+    <main>
+      <header>
+        <h1>Ask policies</h1>
+        <p>Ask about uploaded company documents, a general question, or “get details for user 1”.</p>
+      </header>
+      <div id="log"></div>
+      <form id="form">
+        <input id="input" autocomplete="off" placeholder="How many leave days do employees get?">
+        <button type="submit">Send</button>
+      </form>
+    </main>
+  </div>
+  <script>
+    const userApi = "http://localhost:8090/users";
+    const log = document.getElementById("log");
+    const form = document.getElementById("form");
+    const input = document.getElementById("input");
+    const sendBtn = form.querySelector("button");
+    const fileInput = document.getElementById("file");
+    const drop = document.getElementById("drop");
+    const status = document.getElementById("status");
+    const docs = document.getElementById("docs");
+    let history = [];
+
+    function add(role, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function setStatus(text, isError) {
+      status.textContent = text;
+      status.className = isError ? "error" : "";
+    }
+
+    async function loadDocs() {
+      const res = await fetch("/api/documents");
+      const data = await res.json();
+      docs.innerHTML = "";
+      const items = data.documents || [];
+      if (!items.length) {
+        docs.innerHTML = "<li><span>No documents yet</span></li>";
+        return;
+      }
+      for (const doc of items) {
+        const li = document.createElement("li");
+        li.textContent = doc.name + " ";
+        const meta = document.createElement("span");
+        meta.textContent = doc.chunks + " chunk" + (doc.chunks === 1 ? "" : "s");
+        li.appendChild(meta);
+        docs.appendChild(li);
+      }
+    }
+
+    async function upload(file) {
+      if (!file) return;
+      setStatus("Ingesting " + file.name + "…");
+      const body = new FormData();
+      body.append("file", file);
+      const res = await fetch("/api/ingest", { method: "POST", body });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      setStatus("Stored " + data.chunks + " chunk(s) from " + data.source);
+      await loadDocs();
+    }
+
+    async function ragChat(payload) {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      history = data.history || [];
+      if (data.type === "tool_call") {
+        const results = await Promise.all((data.tool_calls || []).map(runTool));
+        return ragChat({ history, tool_results: results });
+      }
+      return data.reply || "";
+    }
+
+    async function runTool(call) {
+      if (call.name !== "get_user") {
+        return { id: call.id, name: call.name, content: JSON.stringify({ error: "unknown tool" }) };
+      }
+      const args = call.arguments || {};
+      const url = args.email
+        ? userApi + "?email=" + encodeURIComponent(args.email)
+        : userApi + "/" + encodeURIComponent(args.user_id || args.id || "");
+      const res = await fetch(url);
+      return { id: call.id, name: call.name, content: await res.text() };
+    }
+
+    fileInput.addEventListener("change", async () => {
+      try { await upload(fileInput.files[0]); }
+      catch (err) { setStatus(err.message, true); }
+      fileInput.value = "";
+    });
+
+    ["dragenter", "dragover"].forEach((ev) => {
+      drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); });
+    });
+    ["dragleave", "drop"].forEach((ev) => {
+      drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("over"); });
+    });
+    drop.addEventListener("drop", async (e) => {
+      try { await upload(e.dataTransfer.files[0]); }
+      catch (err) { setStatus(err.message, true); }
+    });
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const message = input.value.trim();
+      if (!message) return;
+      input.value = "";
+      add("user", message);
+      sendBtn.disabled = true;
+      try {
+        add("assistant", await ragChat({ message, history }));
+      } catch (err) {
+        add("error", err.message);
+      } finally {
+        sendBtn.disabled = false;
+        input.focus();
+      }
+    });
+
+    loadDocs().catch((err) => setStatus(err.message, true));
+  </script>
+</body>
+</html>
